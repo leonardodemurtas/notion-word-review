@@ -1,39 +1,27 @@
 /**
  * scripts/reindex.js
- * Run: node scripts/reindex.js
- * Expects env: NOTION_TOKEN, NOTION_DB_ID, MEILI_HOST, MEILI_API_KEY, MEILI_INDEX
+ * Pages a Notion DB and writes data/index.json
+ * Expects env: NOTION_TOKEN, NOTION_DB_ID
  */
+const fs = require('fs');
+const path = require('path');
 const fetch = global.fetch || require('node-fetch');
-const { MeiliSearch } = require('meilisearch');
 
 const NOTION_BASE = 'https://api.notion.com/v1';
 const NOTION_TOKEN = process.env.NOTION_TOKEN;
 const DB_ID = process.env.NOTION_DB_ID;
-const MEILI_HOST = process.env.MEILI_HOST;
-const MEILI_KEY = process.env.MEILI_API_KEY;
-const MEILI_INDEX = process.env.MEILI_INDEX || 'words';
 
-if (!NOTION_TOKEN || !DB_ID || !MEILI_HOST || !MEILI_KEY) {
-  console.error('Missing required env vars. See README.');
+if (!NOTION_TOKEN || !DB_ID) {
+  console.error('Missing required env vars: NOTION_TOKEN and NOTION_DB_ID');
   process.exit(1);
 }
 
-(async function main() {
+(async () => {
   try {
-    const client = new MeiliSearch({ host: MEILI_HOST, apiKey: MEILI_KEY });
-    await client.createIndex(MEILI_INDEX).catch(()=>{});
-    const index = client.index(MEILI_INDEX);
-
-    await index.updateSettings({
-      searchableAttributes: ['word','description','example'],
-      filterableAttributes: ['relevance'],
-      sortableAttributes: ['reviewCount','date']
-    });
-
+    console.log('Starting Notion reindex (to data/index.json)...');
+    const docs = [];
     let next_cursor = null;
     const pageSize = 100;
-    const docsBuffer = [];
-    const batchSize = 50;
 
     do {
       const body = { page_size: pageSize };
@@ -50,7 +38,10 @@ if (!NOTION_TOKEN || !DB_ID || !MEILI_HOST || !MEILI_KEY) {
       });
 
       const json = await resp.json();
-      if (!resp.ok) throw new Error(JSON.stringify(json));
+      if (!resp.ok) {
+        console.error('Notion API error:', JSON.stringify(json));
+        process.exit(2);
+      }
 
       for (const p of (json.results || [])) {
         const props = p.properties || {};
@@ -62,26 +53,24 @@ if (!NOTION_TOKEN || !DB_ID || !MEILI_HOST || !MEILI_KEY) {
           example: (props.Example?.rich_text?.[0]?.plain_text) || '',
           reviewCount: props.ReviewCount?.number ?? 0,
           date: props.Date?.date?.start ?? null,
-          relevance: props.Relevance?.select?.name ?? null
+          relevance: props.Relevance?.select?.name ?? null,
+          raw: props
         };
-        docsBuffer.push(doc);
-        if (docsBuffer.length >= batchSize) {
-          await index.addDocuments(docsBuffer.splice(0, docsBuffer.length));
-          console.log('Flushed batch to Meili');
-        }
+        docs.push(doc);
       }
 
       next_cursor = json.has_more ? json.next_cursor : null;
+      console.log('Fetched batch, total so far:', docs.length);
     } while (next_cursor);
 
-    if (docsBuffer.length) {
-      await index.addDocuments(docsBuffer.splice(0, docsBuffer.length));
-    }
-
-    const stats = await index.getStats();
-    console.log('Reindex done. Documents indexed:', stats.numberOfDocuments);
+    const dataDir = path.join(process.cwd(), 'data');
+    if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+    const outPath = path.join(dataDir, 'index.json');
+    fs.writeFileSync(outPath, JSON.stringify(docs, null, 2), 'utf8');
+    console.log('Wrote', outPath, 'with', docs.length, 'documents');
+    process.exit(0);
   } catch (err) {
     console.error('Reindex failed:', err);
-    process.exit(2);
+    process.exit(3);
   }
 })();
